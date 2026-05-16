@@ -77,7 +77,3 @@ Prints today's snapshot (utilization %, reset times, extra usage) straight from 
 - **Unofficial endpoint.** `/api/oauth/usage` is undocumented. If Anthropic changes the response shape, the popover gauges go blank until the parser is updated.
 - **Personal use only.** Don't redistribute the binary to other users — Anthropic's Feb 2026 policy bans third-party reuse of OAuth tokens. Each user must install from source against their own Keychain.
 - **Cross-surface counting.** Anthropic counts your claude.ai web, Claude Desktop, and Claude Code usage against the same weekly limit. The endpoint returns the combined number (not just Claude Code), so this is accurate.
-
-## Project layout
-
-See [`CLAUDE.md`](CLAUDE.md) for architecture, conventions, and the running playbook for changes.
