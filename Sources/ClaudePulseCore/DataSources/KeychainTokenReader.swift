@@ -1,5 +1,4 @@
 import Foundation
-import Security
 
 /// The Claude Code CLI stores a JSON blob under generic-password service
 /// "Claude Code-credentials" of shape
@@ -23,28 +22,29 @@ public enum KeychainTokenReader {
     private static let service = "Claude Code-credentials"
 
     public static func read() throws -> ClaudeCodeToken {
-        let query: [CFString: Any] = [
-            kSecClass: kSecClassGenericPassword,
-            kSecAttrService: service,
-            kSecReturnData: true,
-            kSecMatchLimit: kSecMatchLimitOne,
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        switch status {
-        case errSecSuccess:
-            break
-        case errSecItemNotFound:
-            throw UsageError.tokenUnavailable("Claude Code-credentials item not found in Keychain — has Claude Code been authenticated on this machine?")
-        case errSecUserCanceled, errSecAuthFailed:
-            throw UsageError.tokenUnavailable("Keychain access denied. Click 'Always Allow' the next time the prompt appears.")
-        default:
-            throw UsageError.tokenUnavailable("Keychain read failed (OSStatus \(status))")
+        try read(runner: defaultRunner)
+    }
+
+    static func read(runner: SecurityRunner) throws -> ClaudeCodeToken {
+        let result: SecurityResult
+        do {
+            result = try runner(["find-generic-password", "-s", service, "-w"])
+        } catch {
+            throw UsageError.tokenUnavailable(
+                "Could not invoke /usr/bin/security: \(error.localizedDescription)"
+            )
         }
-        guard let data = item as? Data else {
-            throw UsageError.tokenUnavailable("Keychain item had no data")
+        guard result.status == 0 else {
+            throw UsageError.tokenUnavailable(
+                "security exit \(result.status) — has `claude` been authenticated on this machine?"
+            )
         }
-        return try parse(data)
+        var bytes = result.stdout
+        if bytes.last == 0x0A { bytes.removeLast() }  // `-w` appends a newline
+        guard !bytes.isEmpty else {
+            throw UsageError.tokenUnavailable("security returned empty output")
+        }
+        return try parse(bytes)
     }
 
     static func parse(_ data: Data) throws -> ClaudeCodeToken {
@@ -65,5 +65,34 @@ public enum KeychainTokenReader {
             return Date(timeIntervalSince1970: n >= 1_000_000_000_000 ? n / 1000 : n)
         }()
         return ClaudeCodeToken(accessToken: token, expiresAt: expiresAt)
+    }
+
+    // MARK: - Runner abstraction
+
+    typealias SecurityRunner = @Sendable (_ arguments: [String]) throws -> SecurityResult
+
+    struct SecurityResult: Sendable {
+        let stdout: Data
+        let status: Int32
+    }
+
+    /// Why we shell out instead of calling `SecItemCopyMatching` directly:
+    /// `claude` rotates the OAuth token roughly every 8 hours and resets
+    /// the keychain item's partition_id list when it writes, evicting any
+    /// non-`apple-tool` partition. Reading via `/usr/bin/security` (which
+    /// lives in the `apple-tool` partition) survives those refreshes, so
+    /// the "Always Allow" prompt only ever appears once. See README.
+    static let defaultRunner: SecurityRunner = { arguments in
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = arguments
+        let stdout = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError  = FileHandle.nullDevice
+        proc.standardInput  = FileHandle.nullDevice
+        try proc.run()
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        return SecurityResult(stdout: data, status: proc.terminationStatus)
     }
 }

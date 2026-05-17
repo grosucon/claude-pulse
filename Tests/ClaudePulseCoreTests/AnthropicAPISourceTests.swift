@@ -40,6 +40,72 @@ final class KeychainTokenParseTests: XCTestCase {
     }
 }
 
+/// Module-scope so `@Sendable` runner closures can reference it without
+/// capturing the (non-Sendable) XCTestCase instance.
+private let goodKeychainBlob = """
+{"claudeAiOauth":{"accessToken":"sk-ant-oat01-good","expiresAt":1900000000000}}
+
+""".data(using: .utf8)!  // trailing \n simulates `security -w`
+
+final class KeychainTokenReadFlowTests: XCTestCase {
+    func test_invokes_security_with_correct_arguments() throws {
+        let capture = ArgCapture()
+        _ = try KeychainTokenReader.read { args in
+            capture.set(args)
+            return .init(stdout: goodKeychainBlob, status: 0)
+        }
+        XCTAssertEqual(capture.get(), ["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+    }
+
+    func test_parses_identically_with_or_without_trailing_newline() throws {
+        let withNL    = goodKeychainBlob                    // has the `-w` newline
+        let withoutNL = goodKeychainBlob.dropLast()         // drop the 0x0A
+        let a = try KeychainTokenReader.read { _ in .init(stdout: withNL,    status: 0) }
+        let b = try KeychainTokenReader.read { _ in .init(stdout: Data(withoutNL), status: 0) }
+        XCTAssertEqual(a.accessToken, "sk-ant-oat01-good")
+        XCTAssertEqual(a, b, "trailing newline must not change the parsed token")
+    }
+
+    func test_nonzero_exit_surfaces_as_tokenUnavailable() {
+        XCTAssertThrowsError(try KeychainTokenReader.read { _ in .init(stdout: Data(), status: 44) }) { error in
+            guard case UsageError.tokenUnavailable(let msg) = error else {
+                return XCTFail("got \(error)")
+            }
+            XCTAssertTrue(msg.contains("44"), "exit code should be in the message: \(msg)")
+        }
+    }
+
+    func test_empty_stdout_with_zero_exit_surfaces_as_tokenUnavailable() {
+        XCTAssertThrowsError(try KeychainTokenReader.read { _ in .init(stdout: Data(), status: 0) })
+    }
+
+    func test_runner_throwing_surfaces_as_tokenUnavailable() {
+        struct Boom: Error {}
+        XCTAssertThrowsError(try KeychainTokenReader.read { _ in throw Boom() }) { error in
+            guard case UsageError.tokenUnavailable = error else {
+                return XCTFail("got \(error)")
+            }
+        }
+    }
+
+    func test_does_not_leak_token_into_error_message() {
+        // If parse fails, the original Data must not surface in the thrown error.
+        let secret = "sk-ant-oat01-LEAK-ME-IF-YOU-CAN"
+        let malformed = "{\"unrelated\":\"\(secret)\"}\n".data(using: .utf8)!
+        XCTAssertThrowsError(try KeychainTokenReader.read { _ in .init(stdout: malformed, status: 0) }) { error in
+            XCTAssertFalse("\(error)".contains(secret), "error message must not echo token-shaped bytes")
+        }
+    }
+
+    /// Sendable-safe capture box; `@Sendable` closures can't capture mutable locals.
+    private final class ArgCapture: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: [String]?
+        func set(_ v: [String]) { lock.lock(); value = v; lock.unlock() }
+        func get() -> [String]? { lock.lock(); defer { lock.unlock() }; return value }
+    }
+}
+
 final class AnthropicAPISourceDecodeTests: XCTestCase {
 
     /// Real response shape captured on the author's account 2026-05-16.

@@ -41,6 +41,7 @@ The app reads your Claude Code OAuth token from the macOS Keychain (the same `Cl
 - **No third-party services, no telemetry**, no on-disk caching of the token (ephemeral `URLSession`).
 - **Polls every 5 minutes.** The endpoint is per-token rate-limited (~5 requests per window) and the token is shared with the `claude` CLI itself — polling faster gets you 429'd. On a 429, the next poll is pushed ~20 minutes out (4× backoff) so the endpoint isn't hammered.
 - **Opening the popover does NOT refresh** — would spam the endpoint every time you peek. Press the **Refresh** button (it spins during the fetch) when you want a fresh read.
+- **Keychain reads go through `/usr/bin/security`**, not `SecItemCopyMatching` directly. Reason: `claude` rotates the OAuth token every ~8 hours and its write resets the keychain item's partition list, which would normally evict Claude Pulse and trigger an "Always Allow" prompt three times a day even after you'd already granted access. Apple's `security` CLI lives in the `apple-tool` partition that survives those resets, so the prompt only ever appears on first install. Trade-off: a `Process` spawn per poll instead of an in-process call — negligible at a 5-minute cadence.
 
 ## Install
 
@@ -54,7 +55,7 @@ Builds, bundles, and drops `Claude Pulse.app` into `~/Applications/`:
 - **Finder**: `~/Applications` → Claude Pulse
 - **Auto-launch on login**: System Settings → General → Login Items & Extensions → add `~/Applications/Claude Pulse.app`
 
-The first time you click the menu bar icon, macOS prompts to allow Keychain access — click **Always Allow**.
+The first time you click the menu bar icon, macOS may prompt to allow Keychain access — click **Always Allow**. You should only see this prompt once; see "How it works" for why.
 
 Re-run `./scripts/install.sh` after any code change to refresh the installed bundle. To stop: `pkill -f 'Claude Pulse.app'`.
 
