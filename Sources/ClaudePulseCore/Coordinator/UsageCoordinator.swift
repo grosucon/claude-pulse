@@ -10,9 +10,13 @@ public final class UsageCoordinator {
 
     private let source: any UsageSource
     private let baseInterval: TimeInterval
+    private let postResetGrace: TimeInterval
     /// When the next poll may fire. Bumped forward on 429 so we don't
     /// keep hammering a rate-limited endpoint.
     private var earliestNextPoll: Date = .distantPast
+    /// Session reset boundary to wake at outside the regular cadence.
+    /// Cleared once we've attempted the post-reset fetch.
+    private var pendingResetAt: Date?
     private var refreshTask: Task<Void, Never>?
 
     /// 300s default. The endpoint is per-token rate-limited at roughly
@@ -20,9 +24,18 @@ public final class UsageCoordinator {
     /// number) and the token is *shared* with the `claude` CLI — so the
     /// safe cadence is what every public statusline tool ships with.
     /// On 429 the 4× backoff below (≈ 20 min freeze) is the safety net.
-    public init(source: any UsageSource, refreshInterval: TimeInterval = 300) {
+    ///
+    /// `postResetGrace` is how long to wait after `session.resetAt`
+    /// before forcing a refresh, giving Anthropic a moment to flip the
+    /// window server-side. Tests override to 0.
+    public init(
+        source: any UsageSource,
+        refreshInterval: TimeInterval = 300,
+        postResetGrace: TimeInterval = 10
+    ) {
         self.source = source
         self.baseInterval = refreshInterval
+        self.postResetGrace = postResetGrace
     }
 
     public func start() {
@@ -31,7 +44,7 @@ public final class UsageCoordinator {
             guard let self else { return }
             while !Task.isCancelled {
                 await self.refreshIfDue()
-                let next = await self.timeUntilNextPoll()
+                let next = self.timeUntilNextPoll()
                 try? await Task.sleep(nanoseconds: UInt64(next * 1_000_000_000))
             }
         }
@@ -46,9 +59,18 @@ public final class UsageCoordinator {
         await performRefresh()
     }
 
-    private func refreshIfDue() async {
-        guard Date() >= earliestNextPoll else { return }
-        await performRefresh()
+    func refreshIfDue(now: Date = Date()) async {
+        if now >= earliestNextPoll {
+            await performRefresh()
+            return
+        }
+        // Clear before fetching so a transient failure doesn't loop us
+        // at 1s — next successful snapshot reseeds from `session.resetAt`.
+        if let pending = pendingResetAt,
+           now >= pending.addingTimeInterval(postResetGrace) {
+            pendingResetAt = nil
+            await performRefresh()
+        }
     }
 
     private func performRefresh() async {
@@ -57,7 +79,12 @@ public final class UsageCoordinator {
         do {
             snapshot = try await source.fetch()
             lastError = nil
-            earliestNextPoll = Date().addingTimeInterval(baseInterval)
+            let now = Date()
+            earliestNextPoll = now.addingTimeInterval(baseInterval)
+            // Only schedule a wake if the boundary is genuinely ahead of
+            // us — otherwise (server hadn't flipped yet) the regular
+            // cadence will pick up the next attempt.
+            pendingResetAt = snapshot?.session.resetAt.flatMap { $0 > now ? $0 : nil }
         } catch UsageError.rateLimited {
             lastError = .rateLimited
             // 429 circuit-breaker: hold off for 4× the base interval
@@ -74,7 +101,14 @@ public final class UsageCoordinator {
         }
     }
 
-    private func timeUntilNextPoll() -> TimeInterval {
-        max(1, earliestNextPoll.timeIntervalSince(Date()))
+    func timeUntilNextPoll(now: Date = Date()) -> TimeInterval {
+        var next = max(1, earliestNextPoll.timeIntervalSince(now))
+        if let pending = pendingResetAt {
+            let postReset = pending.addingTimeInterval(postResetGrace).timeIntervalSince(now)
+            if postReset > 0 {
+                next = min(next, postReset)
+            }
+        }
+        return next
     }
 }

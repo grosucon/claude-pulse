@@ -202,9 +202,19 @@ private struct MeterRow: View {
         if let r = meter.resetAt {
             switch resetStyle {
             case .liveCountdown:
-                HStack(spacing: 3) {
-                    Text("resets in")
-                    Text(r, style: .relative)
+                // `Text(_:style:.relative)` shows magnitude only, so once
+                // `r` is in the past the hard-coded "resets in" prefix
+                // would start counting up again. Swap to "resetting…"
+                // until the coordinator's post-reset refresh lands.
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    if r > ctx.date {
+                        HStack(spacing: 3) {
+                            Text("resets in")
+                            Text(r, style: .relative)
+                        }
+                    } else {
+                        Text("resetting…")
+                    }
                 }
                 .font(.caption2)
                 .foregroundStyle(.tertiary)

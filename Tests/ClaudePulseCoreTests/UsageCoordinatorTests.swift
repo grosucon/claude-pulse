@@ -48,4 +48,55 @@ final class UsageCoordinatorTests: XCTestCase {
         XCTAssertEqual(coord.snapshot, snap, "last good snapshot is retained on error")
         XCTAssertEqual(coord.lastError, .tokenUnavailable("test"))
     }
+
+    func test_refresh_fires_after_session_reset_boundary() async {
+        // resetAt is briefly in the future so the future-guard inside
+        // performRefresh seeds `pendingResetAt`. We then tick `refreshIfDue`
+        // from a `now` past the boundary to simulate crossing it.
+        let resetAt = Date().addingTimeInterval(60)
+        let snap1 = makeSnapshot(session: 41, sessionReset: resetAt)
+        let snap2 = makeSnapshot(session: 0, sessionReset: resetAt.addingTimeInterval(18_000))
+        let source = FakeSource([.success(snap1), .success(snap2)])
+        // baseInterval 600s keeps `earliestNextPoll` far in the future so
+        // only the reset-boundary path can trigger the second fetch.
+        let coord = UsageCoordinator(source: source, refreshInterval: 600, postResetGrace: 0)
+
+        await coord.refresh()
+        XCTAssertEqual(coord.snapshot, snap1)
+
+        await coord.refreshIfDue(now: resetAt.addingTimeInterval(1))
+
+        XCTAssertEqual(coord.snapshot, snap2, "should re-fetch after session reset even within base interval")
+        let count = await source.fetchCount
+        XCTAssertEqual(count, 2)
+    }
+
+    func test_refresh_does_not_schedule_wake_for_past_reset() async {
+        // If the server returns a resetAt that's already in the past
+        // (window hadn't flipped yet), we should not re-fire the
+        // post-reset path; the regular cadence picks up the next attempt.
+        let pastReset = Date().addingTimeInterval(-30)
+        let snap = makeSnapshot(session: 41, sessionReset: pastReset)
+        let source = FakeSource([.success(snap), .success(snap)])
+        let coord = UsageCoordinator(source: source, refreshInterval: 600, postResetGrace: 0)
+
+        await coord.refresh()
+        await coord.refreshIfDue(now: Date())
+
+        let count = await source.fetchCount
+        XCTAssertEqual(count, 1, "past-date resetAt must not seed pendingResetAt")
+    }
+
+    func test_refresh_does_not_fire_before_session_reset_boundary() async {
+        let resetAt = Date().addingTimeInterval(3600)
+        let snap = makeSnapshot(session: 41, sessionReset: resetAt)
+        let source = FakeSource([.success(snap), .success(snap)])
+        let coord = UsageCoordinator(source: source, refreshInterval: 600, postResetGrace: 0)
+
+        await coord.refresh()
+        await coord.refreshIfDue(now: Date())  // still within base interval, reset still future
+
+        let count = await source.fetchCount
+        XCTAssertEqual(count, 1, "must not refresh when neither base interval nor reset has elapsed")
+    }
 }
