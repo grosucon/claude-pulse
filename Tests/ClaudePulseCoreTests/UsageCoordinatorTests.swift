@@ -22,6 +22,19 @@ actor FakeSource: UsageSource {
     }
 }
 
+/// Records every append for assertion. Mirrors the FakeSource pattern.
+actor FakeStore: SnapshotStore {
+    private(set) var appended: [SnapshotRecord] = []
+
+    func append(_ record: SnapshotRecord) async throws {
+        appended.append(record)
+    }
+
+    func recent(limit: Int) async throws -> [SnapshotRecord] {
+        Array(appended.reversed().prefix(limit))
+    }
+}
+
 @MainActor
 final class UsageCoordinatorTests: XCTestCase {
 
@@ -85,6 +98,79 @@ final class UsageCoordinatorTests: XCTestCase {
 
         let count = await source.fetchCount
         XCTAssertEqual(count, 1, "past-date resetAt must not seed pendingResetAt")
+    }
+
+    func test_refresh_appends_success_record_to_store() async throws {
+        let snap = makeSnapshot(session: 42)
+        let store = FakeStore()
+        let coord = UsageCoordinator(source: FakeSource([.success(snap)]), store: store)
+
+        await coord.refresh()
+
+        let appended = await store.appended
+        XCTAssertEqual(appended.count, 1)
+        XCTAssertEqual(appended.first?.outcome, .success)
+        let usedPct = try XCTUnwrap(appended.first?.snapshot?.session.usedPct)
+        XCTAssertEqual(usedPct, 42, accuracy: 0.001)
+        XCTAssertEqual(appended.first?.sourceName, "fake")
+    }
+
+    func test_refresh_appends_error_record_with_kind() async {
+        let store = FakeStore()
+        let coord = UsageCoordinator(
+            source: FakeSource([.failure(.rateLimited)]),
+            store: store
+        )
+
+        await coord.refresh()
+
+        let appended = await store.appended
+        XCTAssertEqual(appended.count, 1)
+        XCTAssertEqual(appended.first?.outcome, .error)
+        XCTAssertEqual(appended.first?.errorKind, "rateLimited")
+        XCTAssertNil(appended.first?.snapshot)
+    }
+
+    func test_refresh_works_without_store() async {
+        // Store is optional — app keeps running if path resolution fails.
+        let snap = makeSnapshot()
+        let coord = UsageCoordinator(source: FakeSource([.success(snap)]))
+        await coord.refresh()
+        XCTAssertEqual(coord.snapshot, snap)
+    }
+
+    func test_refresh_dedups_unchanged_usage() async {
+        // Idle-poll case: same percentages, but capturedAt AND the reset
+        // times drift (as the real API does). Dedup must still skip.
+        let reset = Date().addingTimeInterval(3600)
+        let weeklyReset = Date().addingTimeInterval(86_400)
+        let snapA = makeSnapshot(session: 56, sessionReset: reset, weekly: [("All models", 15)],
+                                 weeklyReset: weeklyReset, capturedAt: Date())
+        let snapB = makeSnapshot(session: 56, sessionReset: reset.addingTimeInterval(45), weekly: [("All models", 15)],
+                                 weeklyReset: weeklyReset.addingTimeInterval(45), capturedAt: Date().addingTimeInterval(300))
+        let store = FakeStore()
+        let coord = UsageCoordinator(source: FakeSource([.success(snapA), .success(snapB)]), store: store)
+
+        await coord.refresh()
+        await coord.refresh()
+
+        let appended = await store.appended
+        XCTAssertEqual(appended.count, 1, "identical usage on the second poll must not write a new record")
+        XCTAssertEqual(coord.snapshot, snapB, "in-memory snapshot still advances to the latest fetch")
+    }
+
+    func test_refresh_persists_when_usage_changes() async {
+        let store = FakeStore()
+        let coord = UsageCoordinator(
+            source: FakeSource([.success(makeSnapshot(session: 10)), .success(makeSnapshot(session: 20))]),
+            store: store
+        )
+
+        await coord.refresh()
+        await coord.refresh()
+
+        let appended = await store.appended
+        XCTAssertEqual(appended.count, 2, "a changed usage value writes a new record")
     }
 
     func test_refresh_does_not_fire_before_session_reset_boundary() async {

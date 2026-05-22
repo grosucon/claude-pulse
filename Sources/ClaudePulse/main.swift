@@ -16,7 +16,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // token or the endpoint are unavailable, surface the error rather
         // than show wrong numbers.
         let source = AnthropicAPISource()
-        let coord = UsageCoordinator(source: source)  // 300s default + 4× 429 backoff
+        // `try?` so a path-resolution failure (rare sandboxing edge) leaves
+        // the app running without persistence rather than crashing.
+        let store: JSONLSnapshotStore? = (try? JSONLSnapshotStore.defaultLocation())
+            .map { JSONLSnapshotStore(url: $0) }
+        let coord = UsageCoordinator(source: source, store: store)  // 300s default + 4× 429 backoff
         self.coord = coord
         self.statusController = StatusItemController(coord: coord)
         coord.start()

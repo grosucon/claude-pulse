@@ -218,7 +218,7 @@ public actor AnthropicAPISource: UsageSource {
         else { return s }
         let fractional = s[afterDot..<tzStart]
         let truncated = fractional.prefix(3).padding(toLength: 3, withPad: "0", startingAt: 0)
-        return String(s[..<afterDot] + truncated + s[tzStart...])
+        return String(s[..<afterDot]) + truncated + String(s[tzStart...])
     }
 
     nonisolated(unsafe) private static let isoMs: ISO8601DateFormatter = {

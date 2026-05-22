@@ -6,6 +6,32 @@ final class UsageSnapshotTests: XCTestCase {
         let snap = makeSnapshot(session: 19, weekly: [("All models", 80)])
         XCTAssertEqual(snap.menuBarUsedPct, 19, "menu bar shows session, never weekly")
     }
+
+    func test_hasSameUsage_ignores_capturedAt() {
+        let session = Meter(label: "Current session", usedPct: 50, resetAt: nil)
+        let weekly = [Meter(label: "All models", usedPct: 10, resetAt: nil)]
+        let a = UsageSnapshot(session: session, weekly: weekly, extraUsage: nil, sourceName: "x", capturedAt: Date())
+        let b = UsageSnapshot(session: session, weekly: weekly, extraUsage: nil, sourceName: "x", capturedAt: Date().addingTimeInterval(999))
+        XCTAssertTrue(a.hasSameUsage(as: b), "same usage, different capturedAt → equal")
+    }
+
+    func test_hasSameUsage_detects_changed_meter() {
+        let weekly = [Meter(label: "All models", usedPct: 10, resetAt: nil)]
+        let a = UsageSnapshot(session: Meter(label: "s", usedPct: 50, resetAt: nil), weekly: weekly, extraUsage: nil, sourceName: "x", capturedAt: Date())
+        let b = UsageSnapshot(session: Meter(label: "s", usedPct: 51, resetAt: nil), weekly: weekly, extraUsage: nil, sourceName: "x", capturedAt: a.capturedAt)
+        XCTAssertFalse(a.hasSameUsage(as: b), "different usedPct is a real change")
+    }
+
+    func test_hasSameUsage_ignores_reset_time_drift() {
+        // Anthropic's resets_at drifts by up to ~a minute between polls even
+        // within the same window — that must NOT count as a usage change.
+        let base = Date()
+        let a = makeSnapshot(session: 64, sessionReset: base, weekly: [("All models", 16)],
+                             weeklyReset: base.addingTimeInterval(86_400), capturedAt: base)
+        let b = makeSnapshot(session: 64, sessionReset: base.addingTimeInterval(60), weekly: [("All models", 16)],
+                             weeklyReset: base.addingTimeInterval(86_400 + 60), capturedAt: base.addingTimeInterval(300))
+        XCTAssertTrue(a.hasSameUsage(as: b), "reset-time drift must not register as a usage change")
+    }
 }
 
 final class KeychainTokenParseTests: XCTestCase {

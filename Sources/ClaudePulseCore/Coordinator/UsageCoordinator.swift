@@ -9,6 +9,7 @@ public final class UsageCoordinator {
     public private(set) var isLoading = false
 
     private let source: any UsageSource
+    private let store: (any SnapshotStore)?
     private let baseInterval: TimeInterval
     private let postResetGrace: TimeInterval
     /// When the next poll may fire. Bumped forward on 429 so we don't
@@ -28,12 +29,17 @@ public final class UsageCoordinator {
     /// `postResetGrace` is how long to wait after `session.resetAt`
     /// before forcing a refresh, giving Anthropic a moment to flip the
     /// window server-side. Tests override to 0.
+    ///
+    /// `store` is optional and best-effort: write failures are swallowed
+    /// so a disk problem can't take down the live snapshot.
     public init(
         source: any UsageSource,
+        store: (any SnapshotStore)? = nil,
         refreshInterval: TimeInterval = 300,
         postResetGrace: TimeInterval = 10
     ) {
         self.source = source
+        self.store = store
         self.baseInterval = refreshInterval
         self.postResetGrace = postResetGrace
     }
@@ -77,28 +83,43 @@ public final class UsageCoordinator {
         isLoading = true
         defer { isLoading = false }
         do {
-            snapshot = try await source.fetch()
+            let snap = try await source.fetch()
+            let previous = snapshot
+            snapshot = snap
             lastError = nil
             let now = Date()
             earliestNextPoll = now.addingTimeInterval(baseInterval)
             // Only schedule a wake if the boundary is genuinely ahead of
             // us — otherwise (server hadn't flipped yet) the regular
             // cadence will pick up the next attempt.
-            pendingResetAt = snapshot?.session.resetAt.flatMap { $0 > now ? $0 : nil }
-        } catch UsageError.rateLimited {
-            lastError = .rateLimited
-            // 429 circuit-breaker: hold off for 4× the base interval
-            // (≈ 20 min at default 300s). The endpoint gives no useful
-            // Retry-After, and the data windows are 5h / 7d — no value
-            // in retrying tightly.
-            earliestNextPoll = Date().addingTimeInterval(baseInterval * 4)
-        } catch let err as UsageError {
-            lastError = err
-            earliestNextPoll = Date().addingTimeInterval(baseInterval)
+            pendingResetAt = snap.session.resetAt.flatMap { $0 > now ? $0 : nil }
+            // Dedup: only persist when usage actually moved. Idle polls
+            // produce snapshots identical bar the timestamp; writing each
+            // one just bloats the log.
+            let changed = previous.map { !$0.hasSameUsage(as: snap) } ?? true
+            if changed {
+                await persist(.success(
+                    capturedAt: snap.capturedAt,
+                    sourceName: snap.sourceName,
+                    snapshot: snap
+                ))
+            }
         } catch {
-            lastError = .networkError(String(describing: error))
-            earliestNextPoll = Date().addingTimeInterval(baseInterval)
+            let usageError = (error as? UsageError) ?? .networkError(String(describing: error))
+            lastError = usageError
+            // 429 circuit-breaker: hold off 4× the base interval (≈ 20 min
+            // at 300s). The endpoint gives no useful Retry-After and the
+            // windows are 5h / 7d — no value retrying tightly. Everything
+            // else retries at the base cadence.
+            let backoff = usageError == .rateLimited ? baseInterval * 4 : baseInterval
+            earliestNextPoll = Date().addingTimeInterval(backoff)
+            await persist(.error(capturedAt: Date(), sourceName: source.name, kind: usageError.kind))
         }
+    }
+
+    private func persist(_ record: SnapshotRecord) async {
+        guard let store else { return }
+        try? await store.append(record)
     }
 
     func timeUntilNextPoll(now: Date = Date()) -> TimeInterval {

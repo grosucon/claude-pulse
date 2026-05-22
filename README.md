@@ -74,6 +74,24 @@ swift run -c release CPSmoke
 
 Prints today's snapshot (utilization %, reset times, extra usage) straight from Anthropic.
 
+## On-disk data
+
+Each poll appends a line to:
+
+```
+~/Library/Application Support/ClaudePulse/snapshots.jsonl
+```
+
+Append-only JSONL, one record per line: the parsed usage percentages and reset times (~500 bytes/record). Survives Finder drag-to-Trash of `Claude Pulse.app` and survives `./scripts/install.sh`.
+
+- **Only writes on change.** A successful poll is recorded only when your usage actually moved since the last record — back-to-back idle polls (same numbers) are skipped, so the log doesn't fill with duplicates. Failures (rate-limit, network, malformed) are always recorded.
+- **Capped size.** The file is trimmed to the most recent ~10,000 records (≈ 35 days of *changes* at the 5-minute poll), so it can't grow without bound. At ~500 bytes/record that's a ceiling of ~5 MB.
+- **No tokens are written.** The OAuth bearer never enters the snapshot record — pinned by a regression test. The file is created `0600` (owner read/write only).
+- To clear history: `rm ~/Library/Application\ Support/ClaudePulse/snapshots.jsonl`.
+- Third-party uninstallers like AppCleaner *will* find and delete this file along with the app bundle. If you want history to survive a full uninstall, copy it out first.
+
+Nothing reads the file yet — it's the foundation for upcoming features (burn-rate forecasts, sparkline, threshold notifications).
+
 ## Caveats
 
 - **Unofficial endpoint.** `/api/oauth/usage` is undocumented. If Anthropic changes the response shape, the popover gauges go blank until the parser is updated.
